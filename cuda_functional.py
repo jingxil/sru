@@ -25,301 +25,420 @@ extern "C" {
         return (x > 0.f) ? x : 0.f;
     }
 
-    __global__ void sru_fwd(const float * __restrict__ u, const float * __restrict__ x,
-                            const float * __restrict__ bias, const float * __restrict__ init,
-                            const float * __restrict__ mask_h,
-                            const int len, const int batch, const int d, const int k,
-                            float * __restrict__ h, float * __restrict__ c,
-                            const int activation_type)
-    {
-        assert ((k == 3) || (x == NULL));
 
-        int ncols = batch*d;
-        int col = blockIdx.x * blockDim.x + threadIdx.x;
-        if (col >= ncols) return;
+__global__ void sru_fwd(const float * __restrict__ u,
+  const float * __restrict__ x,
+    const float * __restrict__ b,
+      const float * __restrict__ init_c,
+        const float * __restrict__ mask_h,
+          const int seq_len,
+            const int n_batch,
+              const int d_out,
+                const int k,
+                  float * __restrict__ h, float * __restrict__ c,
+                  const int use_tanh) {
+  /*
+   * u (seq_len, n_batch, d_out, k)
+   * x (seq_len, n_batch, d_in) | NULL
+   * b (2, d_out)
+   * init_c (n_batch, d_out)
+   * mask_h (n_batch, d_out)
+   *
+   * h (seq_len, n_batch, d_out)
+   * c (seq_len, n_batch, d_out)
+   *
+   * */
 
-        int ncols_u = ncols*k;
-        int ncols_x = (k == 3) ? ncols : ncols_u;
+  // k==3 indicates x[-1] == d_out, otherwise k=4 x=NULL
+  assert ((k == 3) || (x == NULL));
 
-        const float bias1 = *(bias + (col%d));
-        const float bias2 = *(bias + (col%d) + d);
-        const float mask = (mask_h == NULL) ? 1.0 : (*(mask_h + col));
-        float cur = *(init + col);
+  int ncols = n_batch * d_out;
+  int ncols_u = n_batch * d_out * k;
+  // if k==4, x is part of u
+  int ncols_x = (k == 3) ? ncols : ncols_u;
 
-        const float *up = u + (col*k);
-        const float *xp = (k == 3) ? (x + col) : (up + 3);
-        float *cp = c + col;
-        float *hp = h + col;
+  int col = blockIdx.x * blockDim.x + threadIdx.x;
+  if (col >= ncols)
+    return;
 
-        for (int row = 0; row < len; ++row)
-        {
-            float g1 = sigmoidf((*(up+1))+bias1);
-            float g2 = sigmoidf((*(up+2))+bias2);
-            cur = (cur-(*up))*g1 + (*up);
-            *cp = cur;
-            float val = (activation_type == 1) ? tanh(cur) : (
-                (activation_type == 2) ? reluf(cur) : cur
-            );
-            *hp = (val*mask-(*xp))*g2 + (*xp);
-            up += ncols_u;
-            xp += ncols_x;
-            cp += ncols;
-            hp += ncols;
-        }
-    }
+  const float bf = * (b + (col % d_out));
+  const float br = * (b + (col % d_out) + d_out);
+  const float mask = (mask_h == 0) ? 1.0 : * (mask_h + col);
 
-    __global__ void sru_bwd(const float * __restrict__ u, const float * __restrict__ x,
-                            const float * __restrict__ bias, const float * __restrict__ init,
-                            const float * __restrict__ mask_h, const float * __restrict__ c,
-                            const float * __restrict__ grad_h, const float * __restrict__ grad_last,
-                            const int len, const int batch, const int d, const int k,
-                            float * __restrict__ grad_u, float * __restrict__ grad_x,
-                            float * __restrict__ grad_bias, float * __restrict__ grad_init,
-                            int activation_type)
-    {
-        assert((k == 3) || (x == NULL));
-        assert((k == 3) || (grad_x == NULL));
+  // timestep 0
+  const float * Wcx_p = u + col * k;
+  const float * Wfx_p = u + col * k + 1;
+  const float * Wrx_p = u + col * k + 2;
+  const float * x_p = (k == 3) ? x + col : u + col * k + 3;
+  const float * prev_c_p = init_c + col;
 
-        int ncols = batch*d;
-        int col = blockIdx.x * blockDim.x + threadIdx.x;
-        if (col >= ncols) return;
+  float * c_p = c + col;
+  float * h_p = h + col;
 
-        int ncols_u = ncols*k;
-        int ncols_x = (k == 3) ? ncols : ncols_u;
+  for (int i = 0; i < seq_len; i++) {
+    float inner_c = * Wcx_p;
+    float fg = sigmoidf(( * Wfx_p) + bf);
+    float rg = sigmoidf(( * Wrx_p) + br);
 
-        const float bias1 = *(bias + (col%d));
-        const float bias2 = *(bias + (col%d) + d);
-        const float mask = (mask_h == NULL) ? 1.0 : (*(mask_h + col));
-        float gbias1 = 0;
-        float gbias2 = 0;
-        float cur = *(grad_last + col);
+    * c_p = fg * ( * prev_c_p) + (1 - fg) * (inner_c); * h_p = rg * (mask * tanh( * c_p)) + (1 - rg) * ( * x_p);
+    // move to next point
+    Wcx_p += ncols_u;
+    Wfx_p += ncols_u;
+    Wrx_p += ncols_u;
+    x_p += ncols_x;
+    prev_c_p = c_p;
+    c_p += ncols;
+    h_p += ncols;
+  }
 
-        const float *up = u + (col*k) + (len-1)*ncols_u;
-        const float *xp = (k == 3) ? (x + col + (len-1)*ncols) : (up + 3);
-        const float *cp = c + col + (len-1)*ncols;
+}
 
-        const float *ghp = grad_h + col + (len-1)*ncols;
-        float *gup = grad_u + (col*k) + (len-1)*ncols_u;
-        float *gxp = (k == 3) ? (grad_x + col + (len-1)*ncols) : (gup + 3);
+__global__ void sru_bwd(const float * __restrict__ u,
+  const float * __restrict__ x,
+    const float * __restrict__ b,
+      const float * __restrict__ init_c,
+        const float * __restrict__ mask_h,
+          const float * __restrict__ c,
+            const float * __restrict__ grad_h,
+              const float * __restrict__ grad_last_c,
+                const int seq_len,
+                  const int n_batch,
+                    const int d_out,
+                      const int k,
+                        float * __restrict__ grad_u, float * __restrict__ grad_x,
+                        float * __restrict__ grad_b, float * __restrict__ grad_init,
+                        int use_tanh) {
+  /*
+   * u (seq_len, n_batch, d_out, k)
+   * x (seq_len, n_batch, d_in) | NULL
+   * b (2, d_out)
+   * init_c (n_batch, d_out)
+   * mask_h (n_batch, d_out)
+   * c (seq_len, n_batch, d_out)
+   * grad_h (seq_len, n_batch, d_out)
+   * grad_last_c (n_batch, d_out)
+   *
+   * grad_u (seq_len, n_batch, d_out, k)
+   * grad_x (seq_len, n_batch, d_in) | NULL
+   * grad_b (2, batch, d_out)
+   * grad_init (n_batch, d_out)
+   *
+   *
+   * According to backprop, at every time step and every position we have
+   * grad_c = grad_h*rg*grad_g(mask*c)*mask;
+   * grad_x = grad_h*(1-rg);
+   * grad_rg = grad_h*(g(mask*c)-x)             from (5)
+   *
+   * grad_inner_c = grad_c*(1-fg);
+   * grad_fg = grad_c*(prev_c-inner_c)
+   * grad_prev_c = grad_c*fg;                   from (4)
+   *
+   * grad_Wrx = grad_br = grad_rg*rg*(1-rg);    from (3)
+   *
+   * grad_Wfx = grad_bf = grad_fg*fg*(1-fg);    from (2)
+   *
+   * grad_Wcx = grad_inner_c                    from (1)
+   * */
 
-        for (int row = len-1; row >= 0; --row)
-        {
-            const float g1 = sigmoidf((*(up+1))+bias1);
-            const float g2 = sigmoidf((*(up+2))+bias2);
+  assert((k == 3) || (x == NULL));
+  assert((k == 3) || (grad_x == NULL));
 
-            const float c_val = (activation_type == 1) ? tanh(*cp) : (
-                (activation_type == 2) ? reluf(*cp) : (*cp)
-            );
+  int ncols = n_batch * d_out;
+  int ncols_u = n_batch * d_out * k;
+  int ncols_x = (k == 3) ? ncols : ncols_u;
 
-            const float x_val = *xp;
-            const float u_val = *up;
-            const float prev_c_val = (row>0) ? (*(cp-ncols)) : (*(init+col));
+  int col = blockIdx.x * blockDim.x + threadIdx.x;
 
-            const float gh_val = *ghp;
+  if (col >= ncols)
+    return;
 
-            // h = c*g2 + x*(1-g2) = (c-x)*g2 + x
-            // c = c'*g1 + g0*(1-g1) = (c'-g0)*g1 + g0
+  const float bf = * (b + (col % d_out));
+  const float br = * (b + (col % d_out) + d_out);
+  const float mask = (mask_h == 0) ? 1.0 : * (mask_h + col);
 
-            // grad wrt x
-            *gxp = gh_val*(1-g2);
+  float * grad_bf_p = grad_b + col;
+  float * grad_br_p = grad_b + col + ncols;
+  float * grad_c_p = grad_init + col;
 
-            // grad wrt g2, u2 and bias2
-            float gg2 = gh_val*(c_val*mask-x_val)*(g2*(1-g2));
-            *(gup+2) = gg2;
-            gbias2 += gg2;
+  // start from timestep T
+  const float * Wcx_p = u + (seq_len - 1) * ncols_u + col * k;
+  const float * Wfx_p = u + (seq_len - 1) * ncols_u + col * k + 1;
+  const float * Wrx_p = u + (seq_len - 1) * ncols_u + col * k + 2;
+  const float * x_p = (k == 3) ? x + (seq_len - 1) * ncols + col : u + (seq_len - 1) * ncols_u + col * k + 3;
+  const float * c_p = c + (seq_len - 1) * ncols + col;
 
-            // grad wrt c
-            const float tmp = (activation_type == 1) ? (g2*(1-c_val*c_val)) : (
-                ((activation_type == 0) || (c_val > 0)) ? g2 : 0.f
-            );
-            const float gc = gh_val*mask*tmp + cur;
+  const float * grad_last_c_p = grad_last_c + col;
 
-            // grad wrt u0
-            *gup = gc*(1-g1);
+  const float * grad_h_p = grad_h + (seq_len - 1) * ncols + col;
 
-            // grad wrt g1, u1, and bias1
-            float gg1 = gc*(prev_c_val-u_val)*(g1*(1-g1));
-            *(gup+1) = gg1;
-            gbias1 += gg1;
+  float * grad_Wcx_p = grad_u + (seq_len - 1) * ncols_u + col * k;
+  float * grad_Wfx_p = grad_u + (seq_len - 1) * ncols_u + col * k + 1;
+  float * grad_Wrx_p = grad_u + (seq_len - 1) * ncols_u + col * k + 2;
+  float * grad_x_p = (k == 3) ? grad_x + (seq_len - 1) * ncols + col : grad_u + (seq_len - 1) * ncols_u + col * k + 3;
 
-            // grad wrt c'
-            cur = gc*g1;
+  * grad_br_p = 0; * grad_bf_p = 0;
+  for (int i = seq_len - 1; i >= 0; i--) {
+    const float fg = sigmoidf( * Wfx_p + bf);
+    const float rg = sigmoidf( * Wrx_p + br);
+    // grad_last_c is the c at time step i
+    * grad_c_p = * grad_last_c_p;
+    // grad_c = grad_h*rg*grad_g(mask*c)*mask
+    * grad_c_p += ( * grad_h_p) * rg * (1 - tanh(mask * ( * c_p)) * tanh(mask * ( * c_p))) * mask;
+    // grad_x = grad_h*(1-rg)
+    * grad_x_p = ( * grad_h_p) * (1 - rg);
+    // grad_rg = grad_h*(g(mask*c)-x)
+    const float grad_rg = ( * grad_h_p) * (tanh(mask * ( * c_p)) - ( * x_p));
+    // grad_inner_c = grad_c*(1-fg)
+    * grad_Wcx_p = ( * grad_c_p) * (1 - fg);
+    // grad_fg = grad_c*(prev_c-inner_c)
+    const float prev_c = i == 0 ? * (init_c + col) : * (c_p - ncols);
+    const float grad_fg = ( * grad_c_p) * (prev_c - ( * Wcx_p));
+    // grad_prev_c = grad_c*fg
+    * grad_c_p = ( * grad_c_p) * fg;
+    grad_last_c_p = grad_c_p;
+    // grad_Wrx = grad_br = grad_rg*rg*(1-rg)
+    * grad_Wrx_p = grad_rg * rg * (1 - rg); * grad_br_p += * grad_Wrx_p;
+    // grad_Wfx = grad_bf = grad_fg*fg*(1-fg)
+    * grad_Wfx_p = grad_fg * fg * (1 - fg); * grad_bf_p += * grad_Wfx_p;
+    // move to next point
+    Wcx_p -= ncols_u;
+    Wfx_p -= ncols_u;
+    Wrx_p -= ncols_u;
+    x_p -= ncols_x;
+    c_p -= ncols;
+    grad_h_p -= ncols;
+    grad_Wcx_p -= ncols_u;
+    grad_Wfx_p -= ncols_u;
+    grad_Wrx_p -= ncols_u;
+    grad_x_p -= ncols_x;
 
-            up -= ncols_u;
-            xp -= ncols_x;
-            cp -= ncols;
-            gup -= ncols_u;
-            gxp -= ncols_x;
-            ghp -= ncols;
-        }
+  }
 
-        *(grad_bias + col) = gbias1;
-        *(grad_bias + col + ncols) = gbias2;
-        *(grad_init +col) = cur;
-    }
+}
 
-    __global__ void sru_bi_fwd(const float * __restrict__ u, const float * __restrict__ x,
-                            const float * __restrict__ bias, const float * __restrict__ init,
-                            const float * __restrict__ mask_h,
-                            const int len, const int batch, const int d, const int k,
-                            float * __restrict__ h, float * __restrict__ c,
-                            const int activation_type)
-    {
-        assert ((k == 3) || (x == NULL));
-        assert ((k == 3) || (k == 4));
+__global__ void sru_bi_fwd(const float * __restrict__ u,
+  const float * __restrict__ x,
+    const float * __restrict__ b,
+      const float * __restrict__ init_c,
+        const float * __restrict__ mask_h,
+          const int seq_len,
+            const int n_batch,
+              const int d_out,
+                const int k,
+                  float * __restrict__ h, float * __restrict__ c,
+                  const int use_tanh) {
+  /*
+   * u (seq_len, n_batch, 2, d_out, k)
+   * x (seq_len, n_batch, d_in) | NULL
+   * b (2, 2, d_out)
+   * init_c (n_batch, 2, d_out)
+   * mask_h (n_batch, 2, d_out)
+   *
+   * h (seq_len, n_batch, 2, d_out)
+   * c (seq_len, n_batch, 2, d_out)
+   *
+   * */
 
-        int ncols = batch*d*2;
-        int col = blockIdx.x * blockDim.x + threadIdx.x;
-        if (col >= ncols) return;
+  assert ((k == 3) || (x == NULL));
+  assert ((k == 3) || (k == 4));
 
-        int ncols_u = ncols*k;
-        int ncols_x = (k == 3) ? ncols : ncols_u;
-        const float mask = (mask_h == NULL) ? 1.0 : (*(mask_h + col));
-        float cur = *(init + col);
+  int ncols = n_batch * 2 * d_out;
+  int ncols_u = ncols * k;
+  // if k==4, x is part of u
+  int ncols_x = (k == 3) ? ncols : ncols_u;
 
-        const int d2 = d*2;
-        const bool flip = (col%d2) >= d;
+  int col = blockIdx.x * blockDim.x + threadIdx.x;
+  if (col >= ncols)
+    return;
 
-        const float bias1 = *(bias + (col%d2));
-        const float bias2 = *(bias + (col%d2) + d2);
-        const float *up = u + (col*k);
-        const float *xp = (k == 3) ? (x + col) : (up + 3);
-        float *cp = c + col;
-        float *hp = h + col;
+  const int d_2_out = 2 * d_out;
+  const float bf = * (b + (col % d_2_out));
+  const float br = * (b + (col % d_2_out) + d_2_out);
+  const float mask = (mask_h == 0) ? 1.0 : * (mask_h + col);
+  // forward encoding if flip==0
+  const bool flip = (col % d_2_out) >= d_out;
+  // timestep 0
+  const float * Wcx_p = u + col * k;
+  const float * Wfx_p = u + col * k + 1;
+  const float * Wrx_p = u + col * k + 2;
+  const float * x_p = (k == 3) ? x + col : u + col * k + 3;
+  const float * prev_c_p = init_c + col;
 
-        if (flip) {
-            up += (len-1)*ncols_u;
-            xp += (len-1)*ncols_x;
-            cp += (len-1)*ncols;
-            hp += (len-1)*ncols;
-        }
+  float * c_p = c + col;
+  float * h_p = h + col;
+  // backward encoding should start from timestep T
+  if (flip) {
+    Wcx_p += (seq_len - 1) * ncols_u;
+    Wfx_p += (seq_len - 1) * ncols_u;
+    Wrx_p += (seq_len - 1) * ncols_u;
+    x_p += (seq_len - 1) * ncols_x;
+    c_p += (seq_len - 1) * ncols;
+    h_p += (seq_len - 1) * ncols;
+  }
 
-        int ncols_u_ = flip ? -ncols_u : ncols_u;
-        int ncols_x_ = flip ? -ncols_x : ncols_x;
-        int ncols_ = flip ? -ncols : ncols;
+  //set proper incremental direction
+  int ncols_u_ = flip ? -ncols_u : ncols_u;
+  int ncols_x_ = flip ? -ncols_x : ncols_x;
+  int ncols_ = flip ? -ncols : ncols;
 
-        for (int cnt = 0; cnt < len; ++cnt)
-        {
-            float g1 = sigmoidf((*(up+1))+bias1);
-            float g2 = sigmoidf((*(up+2))+bias2);
-            cur = (cur-(*up))*g1 + (*up);
-            *cp = cur;
-            float val = (activation_type == 1) ? tanh(cur) : (
-                (activation_type == 2) ? reluf(cur) : cur
-            );
-            *hp = (val*mask-(*xp))*g2 + (*xp);
-            up += ncols_u_;
-            xp += ncols_x_;
-            cp += ncols_;
-            hp += ncols_;
-        }
+  for (int i = 0; i < seq_len; i++) {
+    float inner_c = * Wcx_p;
+    float fg = sigmoidf(( * Wfx_p) + bf);
+    float rg = sigmoidf(( * Wrx_p) + br);
 
-    }
+    * c_p = fg * ( * prev_c_p) + (1 - fg) * (inner_c); * h_p = rg * (mask * tanh( * c_p)) + (1 - rg) * ( * x_p);
+    // move to next point
+    Wcx_p += ncols_u_;
+    Wfx_p += ncols_u_;
+    Wrx_p += ncols_u_;
+    x_p += ncols_x_;
+    prev_c_p = c_p;
+    c_p += ncols_;
+    h_p += ncols_;
+  }
 
-    __global__ void sru_bi_bwd(const float * __restrict__ u, const float * __restrict__ x,
-                            const float * __restrict__ bias, const float * __restrict__ init,
-                            const float * __restrict__ mask_h, const float * __restrict__ c,
-                            const float * __restrict__ grad_h, const float * __restrict__ grad_last,
-                            const int len, const int batch, const int d, const int k,
-                            float * __restrict__ grad_u, float * __restrict__ grad_x,
-                            float * __restrict__ grad_bias, float * __restrict__ grad_init,
-                            int activation_type)
-    {
-        assert((k == 3) || (x == NULL));
-        assert((k == 3) || (grad_x == NULL));
-        assert((k == 3) || (k == 4));
+}
 
-        int ncols = batch*d*2;
-        int col = blockIdx.x * blockDim.x + threadIdx.x;
-        if (col >= ncols) return;
+__global__ void sru_bi_bwd(const float * __restrict__ u,
+  const float * __restrict__ x,
+    const float * __restrict__ b,
+      const float * __restrict__ init_c,
+        const float * __restrict__ mask_h,
+          const float * __restrict__ c,
+            const float * __restrict__ grad_h,
+              const float * __restrict__ grad_last_c,
+                const int seq_len,
+                  const int n_batch,
+                    const int d_out,
+                      const int k,
+                        float * __restrict__ grad_u, float * __restrict__ grad_x,
+                        float * __restrict__ grad_b, float * __restrict__ grad_init,
+                        int use_tanh) {
+  /*
+   * u (seq_len, n_batch, directions, d_out, k)
+   * x (seq_len, n_batch, d_in) | NULL
+   * b (2, directions, d_out)
+   * init_c (n_batch, directions, d_out)
+   * mask_h (n_batch, directions, d_out)
+   * c (seq_len, n_batch, directions, d_out)
+   * grad_h (seq_len, n_batch, directions, d_out)
+   * grad_last_c (n_batch, directions, d_out)
+   *
+   * grad_u (seq_len, n_batch, directions, d_out, k)
+   * grad_x (seq_len, n_batch, d_in) | NULL
+   * grad_b (2, batch, directions, d_out)
+   * grad_init (n_batch, directions, d_out)
+   * */
 
-        int ncols_u = ncols*k;
-        int ncols_x = (k == 3) ? ncols : ncols_u;
+  assert((k == 3) || (x == NULL));
+  assert((k == 3) || (grad_x == NULL));
+  assert((k == 3) || (k == 4));
 
-        const float mask = (mask_h == NULL) ? 1.0 : (*(mask_h + col));
-        float gbias1 = 0;
-        float gbias2 = 0;
-        float cur = *(grad_last + col);
+  int ncols = n_batch * 2 * d_out;
+  int ncols_u = ncols * k;
+  int ncols_x = (k == 3) ? ncols : ncols_u;
+  int d_2_out = 2 * d_out;
 
-        const int d2 = d*2;
-        const bool flip = ((col%d2) >= d);
+  int col = blockIdx.x * blockDim.x + threadIdx.x;
 
-        const float bias1 = *(bias + (col%d2));
-        const float bias2 = *(bias + (col%d2) + d2);
-        const float *up = u + (col*k);
-        const float *xp = (k == 3) ? (x + col) : (up + 3);
-        const float *cp = c + col;
-        const float *ghp = grad_h + col;
-        float *gup = grad_u + (col*k);
-        float *gxp = (k == 3) ? (grad_x + col) : (gup + 3);
+  if (col >= ncols)
+    return;
 
-        if (!flip) {
-            up += (len-1)*ncols_u;
-            xp += (len-1)*ncols_x;
-            cp += (len-1)*ncols;
-            ghp += (len-1)*ncols;
-            gup += (len-1)*ncols_u;
-            gxp += (len-1)*ncols_x;
-        }
+  const float bf = * (b + (col % d_2_out));
+  const float br = * (b + (col % d_2_out) + d_2_out);
+  const float mask = (mask_h == 0) ? 1.0 : * (mask_h + col);
+  // forward encoding if flip==0
+  const bool flip = (col % d_2_out) >= d_out;
 
-        int ncols_u_ = flip ? -ncols_u : ncols_u;
-        int ncols_x_ = flip ? -ncols_x : ncols_x;
-        int ncols_ = flip ? -ncols : ncols;
+  float * grad_bf_p = grad_b + col;
+  float * grad_br_p = grad_b + col + ncols;
+  float * grad_c_p = grad_init + col;
 
-        for (int cnt = 0; cnt < len; ++cnt)
-        {
-            const float g1 = sigmoidf((*(up+1))+bias1);
-            const float g2 = sigmoidf((*(up+2))+bias2);
+  // forward encoding do BP from timestep T
+  const float * Wcx_p = u + (seq_len - 1) * ncols_u + col * k;
+  const float * Wfx_p = u + (seq_len - 1) * ncols_u + col * k + 1;
+  const float * Wrx_p = u + (seq_len - 1) * ncols_u + col * k + 2;
+  const float * x_p =
+    (k == 3) ?
+    x + (seq_len - 1) * ncols + col :
+    u + (seq_len - 1) * ncols_u + col * k + 3;
+  const float * c_p = c + (seq_len - 1) * ncols + col;
 
-            const float c_val = (activation_type == 1) ? tanh(*cp) : (
-                (activation_type == 2) ? reluf(*cp) : (*cp)
-            );
-            const float x_val = *xp;
-            const float u_val = *up;
-            const float prev_c_val = (cnt<len-1) ? (*(cp-ncols_)) : (*(init+col));
+  const float * grad_last_c_p = grad_last_c + col;
 
-            const float gh_val = *ghp;
+  const float * grad_h_p = grad_h + (seq_len - 1) * ncols + col;
 
-            // h = c*g2 + x*(1-g2) = (c-x)*g2 + x
-            // c = c'*g1 + g0*(1-g1) = (c'-g0)*g1 + g0
+  float * grad_Wcx_p = grad_u + (seq_len - 1) * ncols_u + col * k;
+  float * grad_Wfx_p = grad_u + (seq_len - 1) * ncols_u + col * k + 1;
+  float * grad_Wrx_p = grad_u + (seq_len - 1) * ncols_u + col * k + 2;
+  float * grad_x_p =
+    (k == 3) ?
+    grad_x + (seq_len - 1) * ncols + col :
+    grad_u + (seq_len - 1) * ncols_u + col * k + 3;
 
-            // grad wrt x
-            *gxp = gh_val*(1-g2);
+  // BP from timestep 0 if flip==1
+  if (flip) {
+    Wcx_p -= (seq_len - 1) * ncols_u;
+    Wfx_p -= (seq_len - 1) * ncols_u;
+    Wrx_p -= (seq_len - 1) * ncols_u;
+    x_p -= (seq_len - 1) * ncols_x;
+    c_p -= (seq_len - 1) * ncols;
 
-            // grad wrt g2, u2 and bias2
-            float gg2 = gh_val*(c_val*mask-x_val)*(g2*(1-g2));
-            *(gup+2) = gg2;
-            gbias2 += gg2;
+    grad_Wcx_p -= (seq_len - 1) * ncols_u;
+    grad_Wfx_p -= (seq_len - 1) * ncols_u;
+    grad_Wrx_p -= (seq_len - 1) * ncols_u;
+    grad_x_p -= (seq_len - 1) * ncols_x;
+    grad_h_p -= (seq_len - 1) * ncols;
+  }
 
-            // grad wrt c
-            const float tmp = (activation_type == 1) ? (g2*(1-c_val*c_val)) : (
-                ((activation_type == 0) || (c_val > 0)) ? g2 : 0.f
-            );
-            const float gc = gh_val*mask*tmp + cur;
+  // set proper incremental direction
+  int ncols_u_ = flip ? -ncols_u : ncols_u;
+  int ncols_x_ = flip ? -ncols_x : ncols_x;
+  int ncols_ = flip ? -ncols : ncols;
 
-            // grad wrt u0
-            *gup = gc*(1-g1);
+  // init br, bf 
+  * grad_br_p = 0; * grad_bf_p = 0;
+  for (int i = seq_len - 1; i >= 0; i--) {
+    const float fg = sigmoidf( * Wfx_p + bf);
+    const float rg = sigmoidf( * Wrx_p + br);
+    // grad_last_c is the c at time step i
+    * grad_c_p = * grad_last_c_p;
+    // grad_c = grad_h*rg*grad_g(mask*c)*mask
+    * grad_c_p += ( * grad_h_p) * rg * (1 - tanh(mask * ( * c_p)) * tanh(mask * ( * c_p))) * mask;
+    // grad_x = grad_h*(1-rg)
+    * grad_x_p = ( * grad_h_p) * (1 - rg);
+    // grad_rg = grad_h*(g(mask*c)-x)
+    const double grad_rg = ( * grad_h_p) * (tanh(mask * ( * c_p)) - ( * x_p));
+    // grad_inner_c = grad_c*(1-fg)
+    * grad_Wcx_p = ( * grad_c_p) * (1 - fg);
+    // grad_fg = grad_c*(prev_c-inner_c)
+    const double prev_c = i == 0 ? * (init_c + col) : * (c_p - ncols_);
+    const double grad_fg = ( * grad_c_p) * (prev_c - ( * Wcx_p));
+    // grad_prev_c = grad_c*fg
+    * grad_c_p = ( * grad_c_p) * fg;
+    grad_last_c_p = grad_c_p;
+    // grad_Wrx = grad_br = grad_rg*rg*(1-rg)
+    * grad_Wrx_p = grad_rg * rg * (1 - rg); * grad_br_p += * grad_Wrx_p;
+    // grad_Wfx = grad_bf = grad_fg*fg*(1-fg)
+    * grad_Wfx_p = grad_fg * fg * (1 - fg); * grad_bf_p += * grad_Wfx_p;
 
-            // grad wrt g1, u1, and bias1
-            float gg1 = gc*(prev_c_val-u_val)*(g1*(1-g1));
-            *(gup+1) = gg1;
-            gbias1 += gg1;
+    // move to next point
+    Wcx_p -= ncols_u_;
+    Wfx_p -= ncols_u_;
+    Wrx_p -= ncols_u_;
+    x_p -= ncols_x_;
+    c_p -= ncols_;
+    grad_h_p -= ncols_;
+    grad_Wcx_p -= ncols_u_;
+    grad_Wfx_p -= ncols_u_;
+    grad_Wrx_p -= ncols_u_;
+    grad_x_p -= ncols_x_;
 
-            // grad wrt c'
-            cur = gc*g1;
+  }
 
-            up -= ncols_u_;
-            xp -= ncols_x_;
-            cp -= ncols_;
-            gup -= ncols_u_;
-            gxp -= ncols_x_;
-            ghp -= ncols_;
-        }
+}
 
-        *(grad_bias + col) = gbias1;
-        *(grad_bias + col + ncols) = gbias2;
-        *(grad_init +col) = cur;
-    }
+
 }
 """
 
